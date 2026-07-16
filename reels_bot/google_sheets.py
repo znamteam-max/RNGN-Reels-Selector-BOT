@@ -113,8 +113,8 @@ def find_duplicate(sheet_title: str, normalized_url: str) -> DuplicateMatch | No
     return None
 
 
-def _find_template_row(sheet_title: str, rating: int) -> int | None:
-    """Find a formatted existing row with the same rating and status 'нет'."""
+def _find_template_rows(sheet_title: str, rating: int) -> tuple[int | None, int | None]:
+    """Return a row with the same rating and any normal 'нет' row for validation."""
     escaped = _escape_sheet_title(sheet_title)
     response = (
         _service()
@@ -127,17 +127,17 @@ def _find_template_row(sheet_title: str, rating: int) -> int | None:
         .execute(num_retries=2)
     )
     rows = response.get("values", [])
-    fallback_row: int | None = None
+    rating_row: int | None = None
+    validation_row: int | None = None
 
     for row_number, row in enumerate(rows, start=2):
         current_rating = row[0] if len(row) > 0 else ""
         posted_status = row[2] if len(row) > 2 else ""
-        is_not_posted = str(posted_status).strip().casefold() == "нет"
-        if not is_not_posted:
+        if str(posted_status).strip().casefold() != "нет":
             continue
 
-        if fallback_row is None:
-            fallback_row = row_number
+        if validation_row is None:
+            validation_row = row_number
 
         try:
             rating_matches = int(float(str(current_rating).replace(",", "."))) == rating
@@ -145,9 +145,10 @@ def _find_template_row(sheet_title: str, rating: int) -> int | None:
             rating_matches = False
 
         if rating_matches:
-            return row_number
+            rating_row = row_number
+            break
 
-    return fallback_row
+    return rating_row, validation_row
 
 
 def _row_number_from_updated_range(updated_range: str) -> int | None:
@@ -163,7 +164,7 @@ def append_idea(idea: Idea, date_value: str) -> None:
     info = get_sheet_info(idea.category.sheet_id)
     ensure_date_header(info.title)
     escaped = _escape_sheet_title(info.title)
-    template_row = _find_template_row(info.title, idea.rating)
+    rating_row, validation_row = _find_template_rows(info.title, idea.rating)
 
     append_response = (
         _service()
@@ -187,41 +188,138 @@ def append_idea(idea: Idea, date_value: str) -> None:
     appended_row = _row_number_from_updated_range(updated_range)
     requests: list[dict] = []
 
-    if template_row is not None and appended_row is not None and template_row != appended_row:
-        source = {
-            "sheetId": idea.category.sheet_id,
-            "startRowIndex": template_row - 1,
-            "endRowIndex": template_row,
-            "startColumnIndex": 0,
-            "endColumnIndex": 6,
-        }
-        destination = {
-            "sheetId": idea.category.sheet_id,
-            "startRowIndex": appended_row - 1,
-            "endRowIndex": appended_row,
-            "startColumnIndex": 0,
-            "endColumnIndex": 6,
-        }
-        requests.extend(
-            [
+    if appended_row is not None:
+        # Copy only the rating cell format. Copying the whole row could inherit
+        # special blue/green status fills from an unrelated existing idea.
+        if rating_row is not None and rating_row != appended_row:
+            requests.append(
                 {
                     "copyPaste": {
-                        "source": source,
-                        "destination": destination,
+                        "source": {
+                            "sheetId": idea.category.sheet_id,
+                            "startRowIndex": rating_row - 1,
+                            "endRowIndex": rating_row,
+                            "startColumnIndex": 2,
+                            "endColumnIndex": 3,
+                        },
+                        "destination": {
+                            "sheetId": idea.category.sheet_id,
+                            "startRowIndex": appended_row - 1,
+                            "endRowIndex": appended_row,
+                            "startColumnIndex": 2,
+                            "endColumnIndex": 3,
+                        },
                         "pasteType": "PASTE_FORMAT",
                         "pasteOrientation": "NORMAL",
                     }
-                },
+                }
+            )
+
+        if validation_row is not None and validation_row != appended_row:
+            requests.append(
                 {
                     "copyPaste": {
-                        "source": source,
-                        "destination": destination,
+                        "source": {
+                            "sheetId": idea.category.sheet_id,
+                            "startRowIndex": validation_row - 1,
+                            "endRowIndex": validation_row,
+                            "startColumnIndex": 3,
+                            "endColumnIndex": 5,
+                        },
+                        "destination": {
+                            "sheetId": idea.category.sheet_id,
+                            "startRowIndex": appended_row - 1,
+                            "endRowIndex": appended_row,
+                            "startColumnIndex": 3,
+                            "endColumnIndex": 5,
+                        },
                         "pasteType": "PASTE_DATA_VALIDATION",
                         "pasteOrientation": "NORMAL",
                     }
-                },
-            ]
+                }
+            )
+
+        white_centered_format = {
+            "backgroundColor": {"red": 1, "green": 1, "blue": 1},
+            "horizontalAlignment": "CENTER",
+            "verticalAlignment": "MIDDLE",
+        }
+
+        # Force a neutral white row for newly added ideas while keeping the
+        # rating cell's own colour and the URL's hyperlink styling.
+        for start_column, end_column in ((0, 2), (3, 6)):
+            requests.append(
+                {
+                    "repeatCell": {
+                        "range": {
+                            "sheetId": idea.category.sheet_id,
+                            "startRowIndex": appended_row - 1,
+                            "endRowIndex": appended_row,
+                            "startColumnIndex": start_column,
+                            "endColumnIndex": end_column,
+                        },
+                        "cell": {"userEnteredFormat": white_centered_format},
+                        "fields": (
+                            "userEnteredFormat.backgroundColor,"
+                            "userEnteredFormat.horizontalAlignment,"
+                            "userEnteredFormat.verticalAlignment"
+                        ),
+                    }
+                }
+            )
+
+        requests.append(
+            {
+                "repeatCell": {
+                    "range": {
+                        "sheetId": idea.category.sheet_id,
+                        "startRowIndex": appended_row - 1,
+                        "endRowIndex": appended_row,
+                        "startColumnIndex": 2,
+                        "endColumnIndex": 3,
+                    },
+                    "cell": {
+                        "userEnteredFormat": {
+                            "horizontalAlignment": "CENTER",
+                            "verticalAlignment": "MIDDLE",
+                        }
+                    },
+                    "fields": (
+                        "userEnteredFormat.horizontalAlignment,"
+                        "userEnteredFormat.verticalAlignment"
+                    ),
+                }
+            }
         )
+
+    # Dates entered through USER_ENTERED are stored internally as serial
+    # numbers. Set the whole date column to the requested visible format so
+    # values such as 46219 are shown as 16.07.2026, including older bot rows.
+    requests.append(
+        {
+            "repeatCell": {
+                "range": {
+                    "sheetId": idea.category.sheet_id,
+                    "startRowIndex": 1,
+                    "endRowIndex": info.row_count,
+                    "startColumnIndex": 5,
+                    "endColumnIndex": 6,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "numberFormat": {"type": "DATE", "pattern": "dd.mm.yyyy"},
+                        "horizontalAlignment": "CENTER",
+                        "verticalAlignment": "MIDDLE",
+                    }
+                },
+                "fields": (
+                    "userEnteredFormat.numberFormat,"
+                    "userEnteredFormat.horizontalAlignment,"
+                    "userEnteredFormat.verticalAlignment"
+                ),
+            }
+        }
+    )
 
     requests.append(
         {
