@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from functools import lru_cache
 
@@ -112,12 +113,59 @@ def find_duplicate(sheet_title: str, normalized_url: str) -> DuplicateMatch | No
     return None
 
 
+def _find_template_row(sheet_title: str, rating: int) -> int | None:
+    """Find a formatted existing row with the same rating and status 'нет'."""
+    escaped = _escape_sheet_title(sheet_title)
+    response = (
+        _service()
+        .spreadsheets()
+        .values()
+        .get(
+            spreadsheetId=spreadsheet_id(),
+            range=f"'{escaped}'!C2:E",
+        )
+        .execute(num_retries=2)
+    )
+    rows = response.get("values", [])
+    fallback_row: int | None = None
+
+    for row_number, row in enumerate(rows, start=2):
+        current_rating = row[0] if len(row) > 0 else ""
+        posted_status = row[2] if len(row) > 2 else ""
+        is_not_posted = str(posted_status).strip().casefold() == "нет"
+        if not is_not_posted:
+            continue
+
+        if fallback_row is None:
+            fallback_row = row_number
+
+        try:
+            rating_matches = int(float(str(current_rating).replace(",", "."))) == rating
+        except (TypeError, ValueError):
+            rating_matches = False
+
+        if rating_matches:
+            return row_number
+
+    return fallback_row
+
+
+def _row_number_from_updated_range(updated_range: str) -> int | None:
+    match = re.search(r"!A(\d+):F(\d+)$", updated_range)
+    if not match:
+        return None
+    first_row = int(match.group(1))
+    last_row = int(match.group(2))
+    return first_row if first_row == last_row else None
+
+
 def append_idea(idea: Idea, date_value: str) -> None:
     info = get_sheet_info(idea.category.sheet_id)
     ensure_date_header(info.title)
     escaped = _escape_sheet_title(info.title)
+    template_row = _find_template_row(info.title, idea.rating)
 
-    (
+    append_response = (
         _service()
         .spreadsheets()
         .values()
@@ -135,32 +183,72 @@ def append_idea(idea: Idea, date_value: str) -> None:
         .execute(num_retries=2)
     )
 
+    updated_range = append_response.get("updates", {}).get("updatedRange", "")
+    appended_row = _row_number_from_updated_range(updated_range)
+    requests: list[dict] = []
+
+    if template_row is not None and appended_row is not None and template_row != appended_row:
+        source = {
+            "sheetId": idea.category.sheet_id,
+            "startRowIndex": template_row - 1,
+            "endRowIndex": template_row,
+            "startColumnIndex": 0,
+            "endColumnIndex": 6,
+        }
+        destination = {
+            "sheetId": idea.category.sheet_id,
+            "startRowIndex": appended_row - 1,
+            "endRowIndex": appended_row,
+            "startColumnIndex": 0,
+            "endColumnIndex": 6,
+        }
+        requests.extend(
+            [
+                {
+                    "copyPaste": {
+                        "source": source,
+                        "destination": destination,
+                        "pasteType": "PASTE_FORMAT",
+                        "pasteOrientation": "NORMAL",
+                    }
+                },
+                {
+                    "copyPaste": {
+                        "source": source,
+                        "destination": destination,
+                        "pasteType": "PASTE_DATA_VALIDATION",
+                        "pasteOrientation": "NORMAL",
+                    }
+                },
+            ]
+        )
+
+    requests.append(
+        {
+            "sortRange": {
+                "range": {
+                    "sheetId": idea.category.sheet_id,
+                    "startRowIndex": 1,
+                    "endRowIndex": info.row_count,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": 6,
+                },
+                "sortSpecs": [
+                    {
+                        "dimensionIndex": 2,
+                        "sortOrder": "DESCENDING",
+                    }
+                ],
+            }
+        }
+    )
+
     (
         _service()
         .spreadsheets()
         .batchUpdate(
             spreadsheetId=spreadsheet_id(),
-            body={
-                "requests": [
-                    {
-                        "sortRange": {
-                            "range": {
-                                "sheetId": idea.category.sheet_id,
-                                "startRowIndex": 1,
-                                "endRowIndex": info.row_count,
-                                "startColumnIndex": 0,
-                                "endColumnIndex": 6,
-                            },
-                            "sortSpecs": [
-                                {
-                                    "dimensionIndex": 2,
-                                    "sortOrder": "DESCENDING",
-                                }
-                            ],
-                        }
-                    }
-                ]
-            },
+            body={"requests": requests},
         )
         .execute(num_retries=2)
     )
