@@ -10,18 +10,39 @@ from zoneinfo import ZoneInfo
 
 from reels_bot.config import CATEGORIES, allowed_user_ids, required_env, timezone_name
 from reels_bot.google_sheets import append_idea, find_duplicate, get_sheet_info
-from reels_bot.parser import ParseError, parse_idea
+from reels_bot.parser import (
+    ParseError,
+    URL_RE,
+    build_idea,
+    extract_url,
+    normalize_url,
+    parse_details,
+    parse_idea,
+)
 from reels_bot.telegram_api import send_message
 
 
-HELP_TEXT = """Отправь идею в формате:
+DETAILS_MARKER = "ЗАЯВКА: "
+URL_MARKER = "ССЫЛКА: "
 
+HELP_TEXT = """Отправь идею любым из трёх способов:
+
+1) Одним сообщением:
 МК | Майкл Джексон выполняет трюки без страховки | 9 | https://ссылка
 
-Подключены: Ф1, Футбол, НБА, ММА, МК, СК.
-Оценка мощности: целое число от 1 до 10.
+2) Название и ссылка с новой строки в одном сообщении:
+МК | Майкл Джексон выполняет трюки без страховки | 9
+https://ссылка
 
-Бот запишет идею в нужную вкладку, поставит «нет» в колонке «Выложено?», добавит дату и пересортирует таблицу по мощности."""
+3) Двумя сообщениями:
+МК | Майкл Джексон выполняет трюки без страховки | 9
+Затем отправь ссылку в ответ на сообщение бота.
+
+Можно и наоборот: сначала отправить ссылку, затем заполнить:
+МК | Название события | 9
+
+Подключены: Ф1, Футбол, НБА, ММА, МК, СК.
+Оценка мощности: целое число от 1 до 10."""
 
 
 def categories_text() -> str:
@@ -43,24 +64,16 @@ def current_date() -> str:
     return datetime.now(ZoneInfo(timezone_name())).strftime("%d.%m.%Y")
 
 
-def process_text(chat_id: int, text: str) -> None:
-    command = text.strip().split(maxsplit=1)[0].split("@", 1)[0].lower()
-    if command in {"/start", "/help"}:
-        send_message(chat_id, HELP_TEXT)
-        return
-    if command == "/categories":
-        send_message(chat_id, categories_text())
-        return
-    if command.startswith("/"):
-        send_message(chat_id, "Неизвестная команда. Используй /start или /categories.")
-        return
+def duplicate_anywhere(normalized_url: str):
+    for category in CATEGORIES.values():
+        sheet_info = get_sheet_info(category.sheet_id)
+        duplicate = find_duplicate(sheet_info.title, normalized_url)
+        if duplicate:
+            return category, duplicate
+    return None
 
-    try:
-        idea = parse_idea(text)
-    except ParseError as exc:
-        send_message(chat_id, f"❌ {exc}")
-        return
 
+def save_idea(chat_id: int, idea) -> None:
     sheet_info = get_sheet_info(idea.category.sheet_id)
     duplicate = find_duplicate(sheet_info.title, idea.normalized_url)
     if duplicate:
@@ -68,7 +81,7 @@ def process_text(chat_id: int, text: str) -> None:
             chat_id,
             "⚠️ Эта ссылка уже есть в таблице.\n\n"
             f"Раздел: {idea.category.project_name}\n"
-            f"Строка до сортировки/текущая строка: {duplicate.row_number}",
+            f"Строка: {duplicate.row_number}",
         )
         return
 
@@ -82,6 +95,108 @@ def process_text(chat_id: int, text: str) -> None:
         f"Мощь: {idea.rating}\n"
         f"Дата: {date_value}",
     )
+
+
+def process_text(chat_id: int, text: str, reply_to_text: str = "") -> None:
+    command = text.strip().split(maxsplit=1)[0].split("@", 1)[0].lower()
+    if command in {"/start", "/help"}:
+        send_message(chat_id, HELP_TEXT)
+        return
+    if command == "/categories":
+        send_message(chat_id, categories_text())
+        return
+    if command.startswith("/"):
+        send_message(chat_id, "Неизвестная команда. Используй /start или /categories.")
+        return
+
+    # Пользователь отвечает ссылкой на запрос, содержащий три поля заявки.
+    if DETAILS_MARKER in reply_to_text:
+        raw_details = reply_to_text.split(DETAILS_MARKER, 1)[1].splitlines()[0].strip()
+        try:
+            details = parse_details(raw_details)
+            idea = build_idea(details, text)
+        except ParseError as exc:
+            send_message(chat_id, f"❌ {exc}")
+            return
+        save_idea(chat_id, idea)
+        return
+
+    # Пользователь отвечает тремя полями на запрос, содержащий ссылку.
+    if URL_MARKER in reply_to_text:
+        raw_url = reply_to_text.split(URL_MARKER, 1)[1].splitlines()[0].strip()
+        try:
+            details = parse_details(text)
+            idea = build_idea(details, raw_url)
+        except ParseError as exc:
+            send_message(chat_id, f"❌ {exc}")
+            return
+        save_idea(chat_id, idea)
+        return
+
+    stripped = text.strip()
+    has_url = bool(URL_RE.search(stripped))
+    pipe_count = stripped.count("|")
+
+    # Только ссылка: сначала проверяем её во всех подключённых вкладках.
+    if has_url and pipe_count == 0:
+        try:
+            url = extract_url(stripped)
+            normalized = normalize_url(url)
+        except ParseError as exc:
+            send_message(chat_id, f"❌ {exc}")
+            return
+
+        duplicate_result = duplicate_anywhere(normalized)
+        if duplicate_result:
+            category, duplicate = duplicate_result
+            send_message(
+                chat_id,
+                "⚠️ Такая ссылка уже есть.\n\n"
+                f"Раздел: {category.project_name}\n"
+                f"Строка: {duplicate.row_number}",
+            )
+            return
+
+        send_message(
+            chat_id,
+            "✅ Такой ссылки ещё нет. Теперь заполни:\n"
+            "ПРОЕКТ | название | оценка\n\n"
+            f"{URL_MARKER}{url}",
+            force_reply=True,
+        )
+        return
+
+    # Три поля без ссылки: просим прислать ссылку отдельным ответом.
+    if not has_url and pipe_count == 2:
+        try:
+            details = parse_details(stripped)
+        except ParseError as exc:
+            send_message(chat_id, f"❌ {exc}")
+            return
+
+        canonical_details = f"{details.category.code} | {details.title} | {details.rating}"
+        send_message(
+            chat_id,
+            "✅ Данные понял. Теперь отправь ссылку ответом на это сообщение.\n\n"
+            f"{DETAILS_MARKER}{canonical_details}",
+            force_reply=True,
+        )
+        return
+
+    # Полная заявка: ссылка может быть после последнего | или с новой строки.
+    try:
+        idea = parse_idea(stripped)
+    except ParseError as exc:
+        send_message(
+            chat_id,
+            f"❌ {exc}\n\n"
+            "Можно отправить так:\n"
+            "МК | Название события | 9\n"
+            "https://ссылка",
+        )
+        return
+
+    save_idea(chat_id, idea)
 
 
 class handler(BaseHTTPRequestHandler):
@@ -152,9 +267,11 @@ class handler(BaseHTTPRequestHandler):
                 self._send_json(200, {"ok": True, "ignored": True})
                 return
 
-            process_text(chat_id, text)
+            reply_to_message = message.get("reply_to_message") or {}
+            reply_to_text = reply_to_message.get("text")
+            process_text(chat_id, text, reply_to_text if isinstance(reply_to_text, str) else "")
             self._send_json(200, {"ok": True})
-        except Exception as exc:  # noqa: BLE001 - webhook must return a controlled response
+        except Exception as exc:  # noqa: BLE001
             traceback.print_exc()
             try:
                 update_message = locals().get("message") or {}
