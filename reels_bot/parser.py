@@ -38,6 +38,13 @@ class ParseError(ValueError):
 
 
 @dataclass(frozen=True)
+class IdeaDetails:
+    category: Category
+    title: str
+    rating: int
+
+
+@dataclass(frozen=True)
 class Idea:
     category: Category
     title: str
@@ -84,15 +91,15 @@ def normalize_url(value: str) -> str:
     return urlunsplit(("https", netloc, path, query, ""))
 
 
-def parse_idea(text: str) -> Idea:
-    parts = [part.strip() for part in text.split("|")]
-    if len(parts) != 4:
+def parse_details(text: str) -> IdeaDetails:
+    parts = [part.strip() for part in text.strip().split("|")]
+    if len(parts) != 3:
         raise ParseError(
-            "Нужны четыре части через |:\n"
-            "МК | Название события | 9 | https://ссылка"
+            "Нужны три части через |:\n"
+            "МК | Название события | 9"
         )
 
-    raw_category, title, raw_rating, raw_url = parts
+    raw_category, title, raw_rating = parts
     category_code = normalize_category_code(raw_category)
 
     if category_code in UNCONNECTED_CATEGORIES:
@@ -118,11 +125,23 @@ def parse_idea(text: str) -> Idea:
     if not 1 <= rating <= 10:
         raise ParseError("Оценка мощности должна быть от 1 до 10.")
 
+    return IdeaDetails(category=category, title=title, rating=rating)
+
+
+def build_idea(details: IdeaDetails, raw_url: str) -> Idea:
     url = extract_url(raw_url)
     return Idea(
-        category=category,
-        title=title,
-        rating=rating,
+        category=details.category,
+        title=details.title,
+        rating=details.rating,
         url=url,
         normalized_url=normalize_url(url),
     )
+
+
+def parse_idea(text: str) -> Idea:
+    url = extract_url(text)
+    text_without_url = URL_RE.sub("", text, count=1).strip()
+    text_without_url = text_without_url.strip("| \n\t")
+    details = parse_details(text_without_url)
+    return build_idea(details, url)
