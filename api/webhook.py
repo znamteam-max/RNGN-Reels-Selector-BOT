@@ -3,13 +3,21 @@ from __future__ import annotations
 import hmac
 import json
 import os
+import time
 import traceback
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler
 from zoneinfo import ZoneInfo
 
 from reels_bot.config import CATEGORIES, allowed_user_ids, required_env, timezone_name
-from reels_bot.google_sheets import append_idea, find_duplicate, get_sheet_info
+from reels_bot.google_sheets import (
+    append_idea,
+    clear_pending_state,
+    find_duplicate,
+    get_pending_state,
+    get_sheet_info,
+    set_pending_state,
+)
 from reels_bot.parser import (
     ParseError,
     URL_RE,
@@ -25,21 +33,20 @@ from reels_bot.telegram_api import send_message
 DETAILS_MARKER = "ЗАЯВКА: "
 URL_MARKER = "ССЫЛКА: "
 
-HELP_TEXT = """Отправь идею любым из трёх способов:
+HELP_TEXT = """Отправь идею любым способом:
 
 1) Одним сообщением:
 МК | Майкл Джексон выполняет трюки без страховки | 9 | https://ссылка
 
-2) Название и ссылка с новой строки в одном сообщении:
+2) В одном сообщении, но ссылка с новой строки:
 МК | Майкл Джексон выполняет трюки без страховки | 9
 https://ссылка
 
-3) Двумя сообщениями:
-МК | Майкл Джексон выполняет трюки без страховки | 9
-Затем отправь ссылку в ответ на сообщение бота.
-
-Можно и наоборот: сначала отправить ссылку, затем заполнить:
+3) Двумя отдельными сообщениями в любом порядке:
+https://ссылка
 МК | Название события | 9
+
+Отвечать на сообщение бота теперь необязательно.
 
 Подключены: Ф1, Футбол, НБА, ММА, МК, СК.
 Оценка мощности: целое число от 1 до 10."""
@@ -49,19 +56,16 @@ def categories_text() -> str:
     lines = ["Подключённые категории:"]
     for category in CATEGORIES.values():
         lines.append(f"• {category.code} — {category.project_name}")
-    lines.extend(
-        [
-            "",
-            "Пока не подключены:",
-            "• Теннис — Больше",
-            "• НХЛ — Home of Hockey",
-        ]
-    )
+    lines.extend(["", "Пока не подключены:", "• Теннис — Больше", "• НХЛ — Home of Hockey"])
     return "\n".join(lines)
 
 
 def current_date() -> str:
     return datetime.now(ZoneInfo(timezone_name())).strftime("%d.%m.%Y")
+
+
+def state_timestamp() -> str:
+    return datetime.now(ZoneInfo(timezone_name())).isoformat(timespec="seconds")
 
 
 def duplicate_anywhere(normalized_url: str):
@@ -73,9 +77,10 @@ def duplicate_anywhere(normalized_url: str):
     return None
 
 
-def save_idea(chat_id: int, idea) -> None:
+def save_idea(chat_id: int, user_id: int, idea) -> None:
     sheet_info = get_sheet_info(idea.category.sheet_id)
     duplicate = find_duplicate(sheet_info.title, idea.normalized_url)
+    clear_pending_state(chat_id, user_id)
     if duplicate:
         send_message(
             chat_id,
@@ -97,7 +102,19 @@ def save_idea(chat_id: int, idea) -> None:
     )
 
 
-def process_text(chat_id: int, text: str, reply_to_text: str = "") -> None:
+def _read_state_with_short_retry(chat_id: int, user_id: int):
+    # Telegram can deliver two rapidly sent messages to parallel Vercel invocations.
+    # A short retry lets the first invocation finish writing its pending state.
+    for attempt in range(3):
+        state = get_pending_state(chat_id, user_id)
+        if state:
+            return state
+        if attempt < 2:
+            time.sleep(0.45)
+    return None
+
+
+def process_text(chat_id: int, user_id: int, text: str, reply_to_text: str = "") -> None:
     command = text.strip().split(maxsplit=1)[0].split("@", 1)[0].lower()
     if command in {"/start", "/help"}:
         send_message(chat_id, HELP_TEXT)
@@ -105,39 +122,40 @@ def process_text(chat_id: int, text: str, reply_to_text: str = "") -> None:
     if command == "/categories":
         send_message(chat_id, categories_text())
         return
+    if command == "/cancel":
+        clear_pending_state(chat_id, user_id)
+        send_message(chat_id, "✅ Незавершённая заявка очищена.")
+        return
     if command.startswith("/"):
-        send_message(chat_id, "Неизвестная команда. Используй /start или /categories.")
+        send_message(chat_id, "Неизвестная команда. Используй /start, /categories или /cancel.")
         return
 
-    # Пользователь отвечает ссылкой на запрос, содержащий три поля заявки.
+    # Replies remain supported for compatibility.
     if DETAILS_MARKER in reply_to_text:
         raw_details = reply_to_text.split(DETAILS_MARKER, 1)[1].splitlines()[0].strip()
         try:
-            details = parse_details(raw_details)
-            idea = build_idea(details, text)
+            idea = build_idea(parse_details(raw_details), text)
         except ParseError as exc:
             send_message(chat_id, f"❌ {exc}")
             return
-        save_idea(chat_id, idea)
+        save_idea(chat_id, user_id, idea)
         return
 
-    # Пользователь отвечает тремя полями на запрос, содержащий ссылку.
     if URL_MARKER in reply_to_text:
         raw_url = reply_to_text.split(URL_MARKER, 1)[1].splitlines()[0].strip()
         try:
-            details = parse_details(text)
-            idea = build_idea(details, raw_url)
+            idea = build_idea(parse_details(text), raw_url)
         except ParseError as exc:
             send_message(chat_id, f"❌ {exc}")
             return
-        save_idea(chat_id, idea)
+        save_idea(chat_id, user_id, idea)
         return
 
     stripped = text.strip()
     has_url = bool(URL_RE.search(stripped))
     pipe_count = stripped.count("|")
 
-    # Только ссылка: сначала проверяем её во всех подключённых вкладках.
+    # Only a URL. If details are already pending, finish immediately.
     if has_url and pipe_count == 0:
         try:
             url = extract_url(stripped)
@@ -148,6 +166,7 @@ def process_text(chat_id: int, text: str, reply_to_text: str = "") -> None:
 
         duplicate_result = duplicate_anywhere(normalized)
         if duplicate_result:
+            clear_pending_state(chat_id, user_id)
             category, duplicate = duplicate_result
             send_message(
                 chat_id,
@@ -157,16 +176,33 @@ def process_text(chat_id: int, text: str, reply_to_text: str = "") -> None:
             )
             return
 
+        state = _read_state_with_short_retry(chat_id, user_id)
+        if state and state.pending_details:
+            try:
+                idea = build_idea(parse_details(state.pending_details), url)
+            except ParseError as exc:
+                clear_pending_state(chat_id, user_id)
+                send_message(chat_id, f"❌ {exc}")
+                return
+            save_idea(chat_id, user_id, idea)
+            return
+
+        set_pending_state(
+            chat_id,
+            user_id,
+            pending_url=url,
+            updated_at=state_timestamp(),
+        )
         send_message(
             chat_id,
-            "✅ Такой ссылки ещё нет. Теперь заполни:\n"
+            "✅ Такой ссылки ещё нет. Теперь отправь:\n"
             "ПРОЕКТ | название | оценка\n\n"
             f"{URL_MARKER}{url}",
             force_reply=True,
         )
         return
 
-    # Три поля без ссылки: просим прислать ссылку отдельным ответом.
+    # Three details fields. If URL is pending, finish immediately.
     if not has_url and pipe_count == 2:
         try:
             details = parse_details(stripped)
@@ -175,15 +211,31 @@ def process_text(chat_id: int, text: str, reply_to_text: str = "") -> None:
             return
 
         canonical_details = f"{details.category.code} | {details.title} | {details.rating}"
+        state = _read_state_with_short_retry(chat_id, user_id)
+        if state and state.pending_url:
+            try:
+                idea = build_idea(details, state.pending_url)
+            except ParseError as exc:
+                clear_pending_state(chat_id, user_id)
+                send_message(chat_id, f"❌ {exc}")
+                return
+            save_idea(chat_id, user_id, idea)
+            return
+
+        set_pending_state(
+            chat_id,
+            user_id,
+            pending_details=canonical_details,
+            updated_at=state_timestamp(),
+        )
         send_message(
             chat_id,
-            "✅ Данные понял. Теперь отправь ссылку ответом на это сообщение.\n\n"
+            "✅ Данные понял. Теперь отправь ссылку отдельным сообщением.\n\n"
             f"{DETAILS_MARKER}{canonical_details}",
             force_reply=True,
         )
         return
 
-    # Полная заявка: ссылка может быть после последнего | или с новой строки.
     try:
         idea = parse_idea(stripped)
     except ParseError as exc:
@@ -196,7 +248,7 @@ def process_text(chat_id: int, text: str, reply_to_text: str = "") -> None:
         )
         return
 
-    save_idea(chat_id, idea)
+    save_idea(chat_id, user_id, idea)
 
 
 class handler(BaseHTTPRequestHandler):
@@ -209,19 +261,14 @@ class handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self) -> None:
-        self._send_json(
-            200,
-            {
-                "status": "ok",
-                "service": "RNGN Reels Selector Bot",
-                "categories": [category.code for category in CATEGORIES.values()],
-                "telegram_token_configured": bool(os.getenv("TELEGRAM_BOT_TOKEN")),
-                "google_credentials_configured": bool(
-                    os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
-                ),
-                "webhook_secret_configured": bool(os.getenv("TELEGRAM_WEBHOOK_SECRET")),
-            },
-        )
+        self._send_json(200, {
+            "status": "ok",
+            "service": "RNGN Reels Selector Bot",
+            "categories": [category.code for category in CATEGORIES.values()],
+            "telegram_token_configured": bool(os.getenv("TELEGRAM_BOT_TOKEN")),
+            "google_credentials_configured": bool(os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")),
+            "webhook_secret_configured": bool(os.getenv("TELEGRAM_WEBHOOK_SECRET")),
+        })
 
     def do_POST(self) -> None:
         try:
@@ -256,12 +303,10 @@ class handler(BaseHTTPRequestHandler):
             if not isinstance(chat_id, int) or not isinstance(user_id, int):
                 self._send_json(200, {"ok": True, "ignored": True})
                 return
-
             if user_id not in allowed_user_ids():
                 send_message(chat_id, "⛔ У тебя нет доступа к этому боту.")
                 self._send_json(200, {"ok": True, "authorized": False})
                 return
-
             if not isinstance(text, str) or not text.strip():
                 send_message(chat_id, "Отправь текстовое сообщение. Формат есть в /start.")
                 self._send_json(200, {"ok": True, "ignored": True})
@@ -269,7 +314,12 @@ class handler(BaseHTTPRequestHandler):
 
             reply_to_message = message.get("reply_to_message") or {}
             reply_to_text = reply_to_message.get("text")
-            process_text(chat_id, text, reply_to_text if isinstance(reply_to_text, str) else "")
+            process_text(
+                chat_id,
+                user_id,
+                text,
+                reply_to_text if isinstance(reply_to_text, str) else "",
+            )
             self._send_json(200, {"ok": True})
         except Exception as exc:  # noqa: BLE001
             traceback.print_exc()
@@ -277,10 +327,7 @@ class handler(BaseHTTPRequestHandler):
                 update_message = locals().get("message") or {}
                 error_chat_id = (update_message.get("chat") or {}).get("id")
                 if isinstance(error_chat_id, int):
-                    send_message(
-                        error_chat_id,
-                        "❌ Не удалось записать идею. Ошибка сохранена в логах Vercel.",
-                    )
+                    send_message(error_chat_id, "❌ Не удалось записать идею. Ошибка сохранена в логах Vercel.")
             except Exception:
                 traceback.print_exc()
             self._send_json(200, {"ok": False, "error": type(exc).__name__})
