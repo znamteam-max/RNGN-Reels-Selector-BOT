@@ -13,6 +13,7 @@ from reels_bot.parser import Idea, normalize_url
 
 
 SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
+STATE_SHEET_TITLE = "BOT_STATE"
 
 
 @dataclass(frozen=True)
@@ -25,6 +26,13 @@ class DuplicateMatch:
 class SheetInfo:
     title: str
     row_count: int
+
+
+@dataclass(frozen=True)
+class PendingState:
+    row_number: int
+    pending_url: str
+    pending_details: str
 
 
 def _escape_sheet_title(value: str) -> str:
@@ -67,6 +75,129 @@ def get_sheet_info(sheet_id: int) -> SheetInfo:
                 row_count=int(properties.get("gridProperties", {}).get("rowCount", 1000)),
             )
     raise RuntimeError(f"Google Sheets tab with sheetId={sheet_id} was not found")
+
+
+def _ensure_state_sheet() -> None:
+    response = (
+        _service()
+        .spreadsheets()
+        .get(
+            spreadsheetId=spreadsheet_id(),
+            fields="sheets(properties(sheetId,title))",
+        )
+        .execute(num_retries=2)
+    )
+    for sheet in response.get("sheets", []):
+        if sheet.get("properties", {}).get("title") == STATE_SHEET_TITLE:
+            return
+
+    created = (
+        _service()
+        .spreadsheets()
+        .batchUpdate(
+            spreadsheetId=spreadsheet_id(),
+            body={
+                "requests": [
+                    {
+                        "addSheet": {
+                            "properties": {
+                                "title": STATE_SHEET_TITLE,
+                                "hidden": True,
+                                "gridProperties": {"rowCount": 100, "columnCount": 6},
+                            }
+                        }
+                    }
+                ]
+            },
+        )
+        .execute(num_retries=2)
+    )
+    _service().spreadsheets().values().update(
+        spreadsheetId=spreadsheet_id(),
+        range=f"'{STATE_SHEET_TITLE}'!A1:F1",
+        valueInputOption="RAW",
+        body={
+            "values": [[
+                "chat_id",
+                "user_id",
+                "pending_url",
+                "pending_details",
+                "updated_at",
+                "version",
+            ]]
+        },
+    ).execute(num_retries=2)
+
+
+def get_pending_state(chat_id: int, user_id: int) -> PendingState | None:
+    _ensure_state_sheet()
+    response = (
+        _service()
+        .spreadsheets()
+        .values()
+        .get(
+            spreadsheetId=spreadsheet_id(),
+            range=f"'{STATE_SHEET_TITLE}'!A2:F",
+        )
+        .execute(num_retries=2)
+    )
+    for row_number, row in enumerate(response.get("values", []), start=2):
+        row_chat = str(row[0]).strip() if len(row) > 0 else ""
+        row_user = str(row[1]).strip() if len(row) > 1 else ""
+        if row_chat == str(chat_id) and row_user == str(user_id):
+            return PendingState(
+                row_number=row_number,
+                pending_url=str(row[2]).strip() if len(row) > 2 else "",
+                pending_details=str(row[3]).strip() if len(row) > 3 else "",
+            )
+    return None
+
+
+def set_pending_state(
+    chat_id: int,
+    user_id: int,
+    *,
+    pending_url: str = "",
+    pending_details: str = "",
+    updated_at: str = "",
+) -> None:
+    current = get_pending_state(chat_id, user_id)
+    values = [[
+        str(chat_id),
+        str(user_id),
+        pending_url,
+        pending_details,
+        updated_at,
+        "1",
+    ]]
+    if current:
+        target = f"'{STATE_SHEET_TITLE}'!A{current.row_number}:F{current.row_number}"
+        _service().spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id(),
+            range=target,
+            valueInputOption="RAW",
+            body={"values": values},
+        ).execute(num_retries=2)
+        return
+
+    _service().spreadsheets().values().append(
+        spreadsheetId=spreadsheet_id(),
+        range=f"'{STATE_SHEET_TITLE}'!A:F",
+        valueInputOption="RAW",
+        insertDataOption="INSERT_ROWS",
+        body={"values": values},
+    ).execute(num_retries=2)
+
+
+def clear_pending_state(chat_id: int, user_id: int) -> None:
+    current = get_pending_state(chat_id, user_id)
+    if not current:
+        return
+    _service().spreadsheets().values().clear(
+        spreadsheetId=spreadsheet_id(),
+        range=f"'{STATE_SHEET_TITLE}'!A{current.row_number}:F{current.row_number}",
+        body={},
+    ).execute(num_retries=2)
 
 
 def ensure_date_header(sheet_title: str) -> None:
@@ -114,7 +245,6 @@ def find_duplicate(sheet_title: str, normalized_url: str) -> DuplicateMatch | No
 
 
 def _find_template_rows(sheet_title: str, rating: int) -> tuple[int | None, int | None]:
-    """Return a row with the same rating and any normal 'нет' row for validation."""
     escaped = _escape_sheet_title(sheet_title)
     response = (
         _service()
@@ -135,19 +265,15 @@ def _find_template_rows(sheet_title: str, rating: int) -> tuple[int | None, int 
         posted_status = row[2] if len(row) > 2 else ""
         if str(posted_status).strip().casefold() != "нет":
             continue
-
         if validation_row is None:
             validation_row = row_number
-
         try:
             rating_matches = int(float(str(current_rating).replace(",", "."))) == rating
         except (TypeError, ValueError):
             rating_matches = False
-
         if rating_matches:
             rating_row = row_number
             break
-
     return rating_row, validation_row
 
 
@@ -175,11 +301,7 @@ def append_idea(idea: Idea, date_value: str) -> None:
             range=f"'{escaped}'!A:F",
             valueInputOption="USER_ENTERED",
             insertDataOption="INSERT_ROWS",
-            body={
-                "values": [
-                    [idea.title, idea.url, idea.rating, "", "нет", date_value]
-                ]
-            },
+            body={"values": [[idea.title, idea.url, idea.rating, "", "нет", date_value]]},
         )
         .execute(num_retries=2)
     )
@@ -189,164 +311,47 @@ def append_idea(idea: Idea, date_value: str) -> None:
     requests: list[dict] = []
 
     if appended_row is not None:
-        # Copy only the rating cell format. Copying the whole row could inherit
-        # special blue/green status fills from an unrelated existing idea.
         if rating_row is not None and rating_row != appended_row:
-            requests.append(
-                {
-                    "copyPaste": {
-                        "source": {
-                            "sheetId": idea.category.sheet_id,
-                            "startRowIndex": rating_row - 1,
-                            "endRowIndex": rating_row,
-                            "startColumnIndex": 2,
-                            "endColumnIndex": 3,
-                        },
-                        "destination": {
-                            "sheetId": idea.category.sheet_id,
-                            "startRowIndex": appended_row - 1,
-                            "endRowIndex": appended_row,
-                            "startColumnIndex": 2,
-                            "endColumnIndex": 3,
-                        },
-                        "pasteType": "PASTE_FORMAT",
-                        "pasteOrientation": "NORMAL",
-                    }
-                }
-            )
+            requests.append({"copyPaste": {
+                "source": {"sheetId": idea.category.sheet_id, "startRowIndex": rating_row - 1, "endRowIndex": rating_row, "startColumnIndex": 2, "endColumnIndex": 3},
+                "destination": {"sheetId": idea.category.sheet_id, "startRowIndex": appended_row - 1, "endRowIndex": appended_row, "startColumnIndex": 2, "endColumnIndex": 3},
+                "pasteType": "PASTE_FORMAT", "pasteOrientation": "NORMAL",
+            }})
 
         if validation_row is not None and validation_row != appended_row:
-            requests.append(
-                {
-                    "copyPaste": {
-                        "source": {
-                            "sheetId": idea.category.sheet_id,
-                            "startRowIndex": validation_row - 1,
-                            "endRowIndex": validation_row,
-                            "startColumnIndex": 3,
-                            "endColumnIndex": 5,
-                        },
-                        "destination": {
-                            "sheetId": idea.category.sheet_id,
-                            "startRowIndex": appended_row - 1,
-                            "endRowIndex": appended_row,
-                            "startColumnIndex": 3,
-                            "endColumnIndex": 5,
-                        },
-                        "pasteType": "PASTE_DATA_VALIDATION",
-                        "pasteOrientation": "NORMAL",
-                    }
-                }
-            )
+            requests.append({"copyPaste": {
+                "source": {"sheetId": idea.category.sheet_id, "startRowIndex": validation_row - 1, "endRowIndex": validation_row, "startColumnIndex": 3, "endColumnIndex": 5},
+                "destination": {"sheetId": idea.category.sheet_id, "startRowIndex": appended_row - 1, "endRowIndex": appended_row, "startColumnIndex": 3, "endColumnIndex": 5},
+                "pasteType": "PASTE_DATA_VALIDATION", "pasteOrientation": "NORMAL",
+            }})
 
         white_centered_format = {
             "backgroundColor": {"red": 1, "green": 1, "blue": 1},
             "horizontalAlignment": "CENTER",
             "verticalAlignment": "MIDDLE",
         }
-
-        # Force a neutral white row for newly added ideas while keeping the
-        # rating cell's own colour and the URL's hyperlink styling.
         for start_column, end_column in ((0, 2), (3, 6)):
-            requests.append(
-                {
-                    "repeatCell": {
-                        "range": {
-                            "sheetId": idea.category.sheet_id,
-                            "startRowIndex": appended_row - 1,
-                            "endRowIndex": appended_row,
-                            "startColumnIndex": start_column,
-                            "endColumnIndex": end_column,
-                        },
-                        "cell": {"userEnteredFormat": white_centered_format},
-                        "fields": (
-                            "userEnteredFormat.backgroundColor,"
-                            "userEnteredFormat.horizontalAlignment,"
-                            "userEnteredFormat.verticalAlignment"
-                        ),
-                    }
-                }
-            )
+            requests.append({"repeatCell": {
+                "range": {"sheetId": idea.category.sheet_id, "startRowIndex": appended_row - 1, "endRowIndex": appended_row, "startColumnIndex": start_column, "endColumnIndex": end_column},
+                "cell": {"userEnteredFormat": white_centered_format},
+                "fields": "userEnteredFormat.backgroundColor,userEnteredFormat.horizontalAlignment,userEnteredFormat.verticalAlignment",
+            }})
+        requests.append({"repeatCell": {
+            "range": {"sheetId": idea.category.sheet_id, "startRowIndex": appended_row - 1, "endRowIndex": appended_row, "startColumnIndex": 2, "endColumnIndex": 3},
+            "cell": {"userEnteredFormat": {"horizontalAlignment": "CENTER", "verticalAlignment": "MIDDLE"}},
+            "fields": "userEnteredFormat.horizontalAlignment,userEnteredFormat.verticalAlignment",
+        }})
 
-        requests.append(
-            {
-                "repeatCell": {
-                    "range": {
-                        "sheetId": idea.category.sheet_id,
-                        "startRowIndex": appended_row - 1,
-                        "endRowIndex": appended_row,
-                        "startColumnIndex": 2,
-                        "endColumnIndex": 3,
-                    },
-                    "cell": {
-                        "userEnteredFormat": {
-                            "horizontalAlignment": "CENTER",
-                            "verticalAlignment": "MIDDLE",
-                        }
-                    },
-                    "fields": (
-                        "userEnteredFormat.horizontalAlignment,"
-                        "userEnteredFormat.verticalAlignment"
-                    ),
-                }
-            }
-        )
+    requests.append({"repeatCell": {
+        "range": {"sheetId": idea.category.sheet_id, "startRowIndex": 1, "endRowIndex": info.row_count, "startColumnIndex": 5, "endColumnIndex": 6},
+        "cell": {"userEnteredFormat": {"numberFormat": {"type": "DATE", "pattern": "dd.mm.yyyy"}, "horizontalAlignment": "CENTER", "verticalAlignment": "MIDDLE"}},
+        "fields": "userEnteredFormat.numberFormat,userEnteredFormat.horizontalAlignment,userEnteredFormat.verticalAlignment",
+    }})
+    requests.append({"sortRange": {
+        "range": {"sheetId": idea.category.sheet_id, "startRowIndex": 1, "endRowIndex": info.row_count, "startColumnIndex": 0, "endColumnIndex": 6},
+        "sortSpecs": [{"dimensionIndex": 2, "sortOrder": "DESCENDING"}],
+    }})
 
-    # Dates entered through USER_ENTERED are stored internally as serial
-    # numbers. Set the whole date column to the requested visible format so
-    # values such as 46219 are shown as 16.07.2026, including older bot rows.
-    requests.append(
-        {
-            "repeatCell": {
-                "range": {
-                    "sheetId": idea.category.sheet_id,
-                    "startRowIndex": 1,
-                    "endRowIndex": info.row_count,
-                    "startColumnIndex": 5,
-                    "endColumnIndex": 6,
-                },
-                "cell": {
-                    "userEnteredFormat": {
-                        "numberFormat": {"type": "DATE", "pattern": "dd.mm.yyyy"},
-                        "horizontalAlignment": "CENTER",
-                        "verticalAlignment": "MIDDLE",
-                    }
-                },
-                "fields": (
-                    "userEnteredFormat.numberFormat,"
-                    "userEnteredFormat.horizontalAlignment,"
-                    "userEnteredFormat.verticalAlignment"
-                ),
-            }
-        }
-    )
-
-    requests.append(
-        {
-            "sortRange": {
-                "range": {
-                    "sheetId": idea.category.sheet_id,
-                    "startRowIndex": 1,
-                    "endRowIndex": info.row_count,
-                    "startColumnIndex": 0,
-                    "endColumnIndex": 6,
-                },
-                "sortSpecs": [
-                    {
-                        "dimensionIndex": 2,
-                        "sortOrder": "DESCENDING",
-                    }
-                ],
-            }
-        }
-    )
-
-    (
-        _service()
-        .spreadsheets()
-        .batchUpdate(
-            spreadsheetId=spreadsheet_id(),
-            body={"requests": requests},
-        )
-        .execute(num_retries=2)
-    )
+    _service().spreadsheets().batchUpdate(
+        spreadsheetId=spreadsheet_id(), body={"requests": requests}
+    ).execute(num_retries=2)
