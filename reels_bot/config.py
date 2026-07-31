@@ -23,6 +23,7 @@ CATEGORIES: dict[str, Category] = {
     "ММА": Category("ММА", "Весь Спорт — ММА", 1937499593),
     "МК": Category("МК", "Music Core", 2135464428),
     "СК": Category("СК", "Sport Core", 1404936508),
+    "НХЛ": Category("НХЛ", "Home of Hockey", 1864283949),
 }
 
 CATEGORY_ALIASES: dict[str, str] = {
@@ -41,12 +42,14 @@ CATEGORY_ALIASES: dict[str, str] = {
     "SC": "СК",
     "SPORTCORE": "СК",
     "SPORT CORE": "СК",
+    "NHL": "НХЛ",
+    "HOH": "НХЛ",
+    "HOME OF HOCKEY": "НХЛ",
+    "HOMEOFHOCKEY": "НХЛ",
 }
 
 UNCONNECTED_CATEGORIES = {
     "ТЕННИС": "Больше",
-    "НХЛ": "Home of Hockey",
-    "NHL": "Home of Hockey",
 }
 
 
