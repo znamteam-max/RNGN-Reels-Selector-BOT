@@ -48,7 +48,8 @@ https://ссылка
 
 Отвечать на сообщение бота теперь необязательно.
 
-Подключены: Ф1, Футбол, НБА, ММА, МК, СК.
+Подключены: Ф1, Футбол, НБА, ММА, МК, СК, НХЛ.
+Для хоккея работают НХЛ, NHL, HOH и Home of Hockey.
 Оценка мощности: целое число от 1 до 10."""
 
 
@@ -56,7 +57,7 @@ def categories_text() -> str:
     lines = ["Подключённые категории:"]
     for category in CATEGORIES.values():
         lines.append(f"• {category.code} — {category.project_name}")
-    lines.extend(["", "Пока не подключены:", "• Теннис — Больше", "• НХЛ — Home of Hockey"])
+    lines.extend(["", "Пока не подключены:", "• Теннис — Больше"])
     return "\n".join(lines)
 
 
@@ -103,8 +104,6 @@ def save_idea(chat_id: int, user_id: int, idea) -> None:
 
 
 def _read_state_with_short_retry(chat_id: int, user_id: int):
-    # Telegram can deliver two rapidly sent messages to parallel Vercel invocations.
-    # A short retry lets the first invocation finish writing its pending state.
     for attempt in range(3):
         state = get_pending_state(chat_id, user_id)
         if state:
@@ -130,7 +129,6 @@ def process_text(chat_id: int, user_id: int, text: str, reply_to_text: str = "")
         send_message(chat_id, "Неизвестная команда. Используй /start, /categories или /cancel.")
         return
 
-    # Replies remain supported for compatibility.
     if DETAILS_MARKER in reply_to_text:
         raw_details = reply_to_text.split(DETAILS_MARKER, 1)[1].splitlines()[0].strip()
         try:
@@ -155,7 +153,6 @@ def process_text(chat_id: int, user_id: int, text: str, reply_to_text: str = "")
     has_url = bool(URL_RE.search(stripped))
     pipe_count = stripped.count("|")
 
-    # Only a URL. If details are already pending, finish immediately.
     if has_url and pipe_count == 0:
         try:
             url = extract_url(stripped)
@@ -202,7 +199,6 @@ def process_text(chat_id: int, user_id: int, text: str, reply_to_text: str = "")
         )
         return
 
-    # Three details fields. If URL is pending, finish immediately.
     if not has_url and pipe_count == 2:
         try:
             details = parse_details(stripped)
