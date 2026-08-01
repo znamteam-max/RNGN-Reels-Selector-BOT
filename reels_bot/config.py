@@ -24,6 +24,7 @@ CATEGORIES: dict[str, Category] = {
     "МК": Category("МК", "Music Core", 2135464428),
     "СК": Category("СК", "Sport Core", 1404936508),
     "НХЛ": Category("НХЛ", "Home of Hockey", 1864283949),
+    "ТЕННИС": Category("Теннис", "Больше", 663570776),
 }
 
 CATEGORY_ALIASES: dict[str, str] = {
@@ -46,11 +47,12 @@ CATEGORY_ALIASES: dict[str, str] = {
     "HOH": "НХЛ",
     "HOME OF HOCKEY": "НХЛ",
     "HOMEOFHOCKEY": "НХЛ",
+    "TENNIS": "ТЕННИС",
+    "БОЛЬШЕ": "ТЕННИС",
+    "BOLSHE": "ТЕННИС",
 }
 
-UNCONNECTED_CATEGORIES = {
-    "ТЕННИС": "Больше",
-}
+UNCONNECTED_CATEGORIES: dict[str, str] = {}
 
 
 def normalize_category_code(value: str) -> str:
